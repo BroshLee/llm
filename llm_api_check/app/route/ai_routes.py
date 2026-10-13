@@ -1,9 +1,12 @@
 
 import httpx
 
-from fastapi import APIRouter, HTTPException, Request
+from datetime import datetime
+
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.models import LLMRequest
 
@@ -13,6 +16,8 @@ router = APIRouter(
     tags=["AI"],
 )
 
+
+# ---------- Request and response schemas ----------
 
 class PromptRequest(BaseModel):
     prompt: str = Field(
@@ -42,12 +47,56 @@ class PromptResponse(BaseModel):
     performance: Performance
 
 
-async def get_db(request: Request):
-    session_factory = request.app.state.session_factory
+class HistoryItem(BaseModel):
+    id: int
+    prompt: str
+    answer: str
+    model: str
+    usage: TokenUsage
+    performance: Performance
+    created_at: datetime
 
-    async with session_factory() as session:
-        yield session
 
+class PaginatedHistory(BaseModel):
+    items: list[HistoryItem]
+    total_records: int
+    page: int
+    limit: int
+    total_pages: int
+
+
+class TokenUsageSummary(BaseModel):
+    total_requests: int
+    total_input_tokens: int
+    total_output_tokens: int
+    total_tokens: int
+    average_tokens_per_second: float
+
+
+# ---------- Shared database response formatter ----------
+
+def serialize_request(row: LLMRequest) -> dict:
+    return {
+        "id": row.id,
+        "prompt": row.prompt,
+        "answer": row.answer,
+        "model": row.model,
+        "usage": {
+            "input_tokens": row.input_tokens,
+            "output_tokens": row.output_tokens,
+            "total_tokens": row.total_tokens,
+        },
+        "performance": {
+            "prompt_eval_duration_ns": row.prompt_eval_duration_ns,
+            "generation_duration_ns": row.generation_duration_ns,
+            "total_duration_ns": row.total_duration_ns,
+            "tokens_per_second": row.tokens_per_second,
+        },
+        "created_at": row.created_at,
+    }
+
+
+# ---------- Generate an LLM response ----------
 
 @router.post(
     "/generate",
@@ -118,10 +167,12 @@ async def generate_answer(
 
             record_id = db_record.id
 
-    except Exception as exc:
+    except SQLAlchemyError as exc:
         raise HTTPException(
             status_code=500,
-            detail="LLM response generated, but saving to the database failed.",
+            detail=(
+                "LLM response generated, but saving to the database failed."
+            ),
         ) from exc
 
     # Step 3: Return the response and its database ID.
@@ -131,52 +182,136 @@ async def generate_answer(
     }
 
 
-@router.get("/history")
+# ---------- 1. Paginated request history ----------
+
+@router.get(
+    "/history",
+    response_model=PaginatedHistory,
+)
 async def get_history(
     request: Request,
-    limit: int = 20,
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=100),
 ):
-    if not 1 <= limit <= 100:
-        raise HTTPException(
-            status_code=422,
-            detail="limit must be between 1 and 100.",
-        )
-
     session_factory = request.app.state.session_factory
 
-    from sqlalchemy import select
+    offset = (page - 1) * limit
 
-    async with session_factory() as session:
-        query = (
-            select(LLMRequest)
-            .order_by(LLMRequest.id.desc())
-            .limit(limit)
+    try:
+        async with session_factory() as session:
+            # Count all matching records.
+            count_query = select(func.count()).select_from(LLMRequest)
+            total_records = await session.scalar(count_query)
+            total_records = total_records or 0
+
+            # Fetch only the requested page.
+            history_query = (
+                select(LLMRequest)
+                .order_by(LLMRequest.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+
+            result = await session.scalars(history_query)
+            rows = result.all()
+
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not retrieve request history.",
+        ) from exc
+
+    total_pages = (
+        (total_records + limit - 1) // limit
+        if total_records
+        else 0
+    )
+
+    return {
+        "items": [serialize_request(row) for row in rows],
+        "total_records": total_records,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages,
+    }
+
+
+# ---------- 2. Retrieve one request by ID ----------
+
+@router.get(
+    "/history/{request_id}",
+    response_model=HistoryItem,
+)
+async def get_request_detail(
+    request_id: int,
+    request: Request,
+):
+    session_factory = request.app.state.session_factory
+
+    try:
+        async with session_factory() as session:
+            query = select(LLMRequest).where(
+                LLMRequest.id == request_id
+            )
+
+            row = await session.scalar(query)
+
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not retrieve the requested record.",
+        ) from exc
+
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"LLM request with ID {request_id} was not found.",
         )
 
-        rows = (await session.scalars(query)).all()
+    return serialize_request(row)
 
-        return [
-            {
-                "id": row.id,
-                "prompt": row.prompt,
-                "answer": row.answer,
-                "model": row.model,
-                "usage": {
-                    "input_tokens": row.input_tokens,
-                    "output_tokens": row.output_tokens,
-                    "total_tokens": row.total_tokens,
-                },
-                "performance": {
-                    "prompt_eval_duration_ns": (
-                        row.prompt_eval_duration_ns
-                    ),
-                    "generation_duration_ns": (
-                        row.generation_duration_ns
-                    ),
-                    "total_duration_ns": row.total_duration_ns,
-                    "tokens_per_second": row.tokens_per_second,
-                },
-                "created_at": row.created_at,
-            }
-            for row in rows
-        ]
+
+# ---------- 3. Aggregate token usage in PostgreSQL ----------
+
+@router.get(
+    "/usage",
+    response_model=TokenUsageSummary,
+)
+async def get_token_usage(request: Request):
+    session_factory = request.app.state.session_factory
+
+    query = select(
+        func.count(LLMRequest.id).label("total_requests"),
+        func.coalesce(
+            func.sum(LLMRequest.input_tokens), 0
+        ).label("total_input_tokens"),
+        func.coalesce(
+            func.sum(LLMRequest.output_tokens), 0
+        ).label("total_output_tokens"),
+        func.coalesce(
+            func.sum(LLMRequest.total_tokens), 0
+        ).label("total_tokens"),
+        func.coalesce(
+            func.avg(LLMRequest.tokens_per_second), 0.0
+        ).label("average_tokens_per_second"),
+    )
+
+    try:
+        async with session_factory() as session:
+            result = (await session.execute(query)).mappings().one()
+
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not calculate token usage.",
+        ) from exc
+
+    return {
+        "total_requests": result["total_requests"],
+        "total_input_tokens": result["total_input_tokens"],
+        "total_output_tokens": result["total_output_tokens"],
+        "total_tokens": result["total_tokens"],
+        "average_tokens_per_second": round(
+            float(result["average_tokens_per_second"]), 2
+        ),
+    }
