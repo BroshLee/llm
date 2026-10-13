@@ -4,21 +4,35 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI
 
+load_dotenv()
+
+from app.database import create_database, create_tables
 from app.route.ai_routes import router as ai_router
 from app.services.ai_client import AIClient
 
 
-load_dotenv()
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.ai_client = AIClient()
+    # Initialize database connections and sessions.
+    engine, session_factory = create_database()
+
+    app.state.engine = engine
+    app.state.session_factory = session_factory
 
     try:
+        # Create missing tables before serving requests.
+        await create_tables(engine)
+
+        # Initialize the Ollama client.
+        app.state.ai_client = AIClient()
+
         yield
+
     finally:
-        await app.state.ai_client.close()
+        if hasattr(app.state, "ai_client"):
+            await app.state.ai_client.close()
+
+        await engine.dispose()
 
 
 app = FastAPI(
