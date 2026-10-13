@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from app.route.ai_routes import router as ai_router
 from app.services.ai_client import AIClient
 
+
 load_dotenv()
 
 
@@ -21,7 +22,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="My Backend API",
+    title="Ollama LLM API",
     lifespan=lifespan,
 )
 
@@ -30,4 +31,6 @@ app.include_router(ai_router)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+    }

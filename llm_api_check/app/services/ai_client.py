@@ -1,16 +1,6 @@
 
 import os
-from dataclasses import dataclass
-
 import httpx
-
-
-@dataclass
-class GenerationResult:
-    answer: str
-    prompt_tokens: int
-    output_tokens: int
-    tokens_per_second: float
 
 
 class AIClient:
@@ -21,16 +11,19 @@ class AIClient:
         )
         self.model = os.getenv(
             "OLLAMA_MODEL",
-            "gemma4:e4b",
+            "llama3:latest",
             # "deepseek-coder:latest",
         )
 
         self.client = httpx.AsyncClient(
             base_url=self.base_url,
-            timeout=httpx.Timeout(180.0, connect=5.0),
+            timeout=httpx.Timeout(
+                180.0,
+                connect=5.0,
+            ),
         )
 
-    async def generate(self, prompt: str) -> GenerationResult:
+    async def generate(self, prompt: str) -> dict:
         response = await self.client.post(
             "/api/chat",
             json={
@@ -48,16 +41,45 @@ class AIClient:
         response.raise_for_status()
         data = response.json()
 
-        # Ollama reports token counts directly; eval_duration is in nanoseconds.
+        # Extract token statistics from Ollama
+        input_tokens = data.get("prompt_eval_count", 0)
         output_tokens = data.get("eval_count", 0)
-        eval_seconds = data.get("eval_duration", 0) / 1e9
 
-        return GenerationResult(
-            answer=data["message"]["content"],
-            prompt_tokens=data.get("prompt_eval_count", 0),
-            output_tokens=output_tokens,
-            tokens_per_second=round(output_tokens / eval_seconds, 2) if eval_seconds else 0.0,
+        # Ollama reports durations in nanoseconds
+        prompt_duration_ns = data.get(
+            "prompt_eval_duration", 0
         )
+        generation_duration_ns = data.get(
+            "eval_duration", 0
+        )
+        total_duration_ns = data.get(
+            "total_duration", 0
+        )
+
+        # Calculate generation speed
+        tokens_per_second = (
+            output_tokens / (generation_duration_ns / 1e9)
+            if generation_duration_ns > 0
+            else 0.0
+        )
+
+        return {
+            "model": data.get("model", self.model),
+            "answer": data["message"]["content"],
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+            "performance": {
+                "prompt_eval_duration_ns": prompt_duration_ns,
+                "generation_duration_ns": generation_duration_ns,
+                "total_duration_ns": total_duration_ns,
+                "tokens_per_second": round(
+                    tokens_per_second, 2
+                ),
+            },
+        }
 
     async def close(self):
         await self.client.aclose()
