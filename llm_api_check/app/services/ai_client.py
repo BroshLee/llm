@@ -1,6 +1,29 @@
 
 import os
+
 import httpx
+
+
+SYSTEM_PROMPT = """
+You are a helpful technical assistant.
+
+Format your answers using clean, readable Markdown.
+
+Follow these rules:
+1. Start with a short, descriptive heading when appropriate.
+2. Use clear section headings for longer answers.
+3. Use bullet points or numbered steps for explanations.
+4. Put Python code inside fenced code blocks with the python language label.
+5. Use inline code formatting for variables, functions, commands,
+   filenames, and API endpoints.
+6. Use tables only when comparing multiple items.
+7. Explain code examples in simple, step-by-step language.
+8. Highlight important warnings and key takeaways.
+9. Avoid unnecessary repetition and excessively long paragraphs.
+10. Adapt the structure to the question. For simple questions,
+    answer concisely without unnecessary headings.
+11. Do not invent facts or claim that code was executed when it was not.
+"""
 
 
 class AIClient:
@@ -9,6 +32,7 @@ class AIClient:
             "OLLAMA_BASE_URL",
             "http://localhost:11434",
         )
+
         self.model = os.getenv(
             "OLLAMA_MODEL",
             "llama3:latest",
@@ -24,11 +48,21 @@ class AIClient:
         )
 
     async def chat(self, messages: list[dict]) -> dict:
+        # Add formatting instructions before the conversation.
+        formatted_messages = [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
+            },
+            *messages,
+        ]
+        # formatted_messages = messages
+
         response = await self.client.post(
             "/api/chat",
             json={
                 "model": self.model,
-                "messages": messages,
+                "messages": formatted_messages,
                 "stream": False,
             },
         )
@@ -36,11 +70,9 @@ class AIClient:
         response.raise_for_status()
         data = response.json()
 
-        # Extract token statistics from Ollama
         input_tokens = data.get("prompt_eval_count") or 0
         output_tokens = data.get("eval_count") or 0
 
-        # Ollama reports durations in nanoseconds
         prompt_duration_ns = (
             data.get("prompt_eval_duration") or 0
         )
@@ -51,7 +83,6 @@ class AIClient:
             data.get("total_duration") or 0
         )
 
-        # Calculate generation speed
         tokens_per_second = (
             output_tokens / (generation_duration_ns / 1e9)
             if generation_duration_ns > 0
@@ -77,7 +108,6 @@ class AIClient:
         }
 
     async def generate(self, prompt: str) -> dict:
-        # Preserve the existing single-prompt API.
         return await self.chat([
             {
                 "role": "user",

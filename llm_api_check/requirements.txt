@@ -5,3 +5,4 @@ python-dotenv==1.2.4
 # sqlalchemy[asyncio]
 sqlalchemy==2.0.54
 asyncpg==0.32.0
+alembic
