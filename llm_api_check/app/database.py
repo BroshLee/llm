@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 
+# Shared base class for all SQLAlchemy models.
 class Base(DeclarativeBase):
     pass
 
@@ -33,17 +34,3 @@ def create_database():
     )
 
     return engine, session_factory
-
-
-async def create_tables(engine):
-    # Importing models registers their tables with Base.
-    from app.models import (
-        Conversation,
-        ConversationMessage,
-        LLMRequest,
-    )
-
-    async with engine.begin() as connection:
-        await connection.run_sync(
-            Base.metadata.create_all
-        )
