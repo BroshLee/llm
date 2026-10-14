@@ -1,5 +1,6 @@
 
 import logging
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import httpx
@@ -12,7 +13,8 @@ from fastapi import (
     Request,
     status,
 )
-from pydantic import BaseModel, Field, field_validator
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field, field_validator, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -23,6 +25,11 @@ from app.models import (
 )
 from app.security import require_api_key
 
+from app.schemas.ai_schemas import (
+    SkillExtractionRequest,
+    SkillExtractionResult,
+    StructuredJSONResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -182,9 +189,10 @@ async def save_llm_request(
     return record
 
 
-async def call_ollama(request: Request, messages: list[dict]) -> dict:
+@contextmanager
+def ollama_errors(request: Request):
     try:
-        return await request.app.state.ai_client.chat(messages)
+        yield
 
     except httpx.TimeoutException as exc:
         raise HTTPException(
@@ -220,28 +228,79 @@ async def call_ollama(request: Request, messages: list[dict]) -> dict:
         ) from exc
 
 
-# ---------- Single-prompt generation ----------
+async def call_ollama(request: Request, messages: list[dict]) -> dict:
+    with ollama_errors(request):
+        return await request.app.state.ai_client.chat(messages)
 
-@router.post("/generate", response_model=PromptResponse)
-async def generate_answer(
-    payload: PromptRequest,
+
+async def open_ollama_stream(
     request: Request,
-):
-    result = await call_ollama(
-        request,
-        [{"role": "user", "content": payload.prompt}],
+    messages: list[dict],
+) -> httpx.Response:
+    with ollama_errors(request):
+        return await request.app.state.ai_client.open_chat_stream(
+            messages
+        )
+
+
+def stream_answer(
+    request: Request,
+    response: httpx.Response,
+    save,
+    headers: dict | None = None,
+) -> StreamingResponse:
+    async def body():
+        result = None
+
+        try:
+            async for item in request.app.state.ai_client.iter_chat_stream(
+                response
+            ):
+                if isinstance(item, str):
+                    yield item
+                else:
+                    result = item
+
+        except (httpx.HTTPError, ValueError):
+            # Status 200 is already sent, so report the failure in-band.
+            logger.exception(
+                "ollama_stream_failed",
+                extra={"request_id": request.state.request_id},
+            )
+            yield "\n\n[error: the answer was interrupted]"
+            return
+
+        if result is None:
+            return
+
+        try:
+            await save(result)
+        except HTTPException:
+            # Already logged by the save helper; the answer was delivered.
+            pass
+
+    return StreamingResponse(
+        body(),
+        media_type="text/plain; charset=utf-8",
+        headers=headers,
     )
 
+
+async def save_generation(
+    request: Request,
+    prompt: str,
+    result: dict,
+) -> int:
     try:
         async with request.app.state.session_factory() as session:
             async with session.begin():
                 record = await save_llm_request(
                     session,
                     result,
-                    payload.prompt,
+                    prompt,
                 )
                 await session.flush()
-                record_id = record.id
+                return record.id
 
     except SQLAlchemyError as exc:
         logger.exception(
@@ -255,13 +314,11 @@ async def generate_answer(
             detail="Could not save the LLM request.",
         ) from exc
 
-    return {**result, "id": record_id}
 
-
-# ---------- Conversation memory ----------
-
-@router.post("/chat", response_model=ChatResponse)
-async def chat(payload: ChatRequest, request: Request):
+async def load_conversation(
+    request: Request,
+    payload: ChatRequest,
+) -> tuple[int, list[dict]]:
     session_factory = request.app.state.session_factory
     conversation_id = payload.conversation_id
 
@@ -318,16 +375,18 @@ async def chat(payload: ChatRequest, request: Request):
             detail="Could not load conversation history.",
         ) from exc
 
-    messages = [
-        *history,
-        {"role": "user", "content": payload.message},
-    ]
+    return conversation_id, history
 
-    result = await call_ollama(request, messages)
 
+async def save_chat_turn(
+    request: Request,
+    conversation_id: int,
+    message: str,
+    result: dict,
+) -> int:
     # Persist both messages and the usage record in one transaction.
     try:
-        async with session_factory() as session:
+        async with request.app.state.session_factory() as session:
             async with session.begin():
                 conversation = await session.get(
                     Conversation, conversation_id
@@ -343,7 +402,7 @@ async def chat(payload: ChatRequest, request: Request):
                     ConversationMessage(
                         conversation_id=conversation_id,
                         role="user",
-                        content=payload.message,
+                        content=message,
                     ),
                     ConversationMessage(
                         conversation_id=conversation_id,
@@ -357,12 +416,12 @@ async def chat(payload: ChatRequest, request: Request):
                 record = await save_llm_request(
                     session,
                     result,
-                    payload.message,
+                    message,
                     conversation_id,
                 )
 
                 await session.flush()
-                record_id = record.id
+                return record.id
 
     except SQLAlchemyError as exc:
         logger.exception(
@@ -377,11 +436,89 @@ async def chat(payload: ChatRequest, request: Request):
             detail="Could not save the conversation.",
         ) from exc
 
+
+# ---------- Single-prompt generation ----------
+
+@router.post("/generate", response_model=PromptResponse)
+async def generate_answer(
+    payload: PromptRequest,
+    request: Request,
+):
+    result = await call_ollama(
+        request,
+        [{"role": "user", "content": payload.prompt}],
+    )
+
+    record_id = await save_generation(request, payload.prompt, result)
+
+    return {**result, "id": record_id}
+
+
+@router.post("/generate/stream")
+async def generate_answer_stream(
+    payload: PromptRequest,
+    request: Request,
+):
+    response = await open_ollama_stream(
+        request,
+        [{"role": "user", "content": payload.prompt}],
+    )
+
+    async def save(result: dict) -> None:
+        await save_generation(request, payload.prompt, result)
+
+    return stream_answer(request, response, save)
+
+
+# ---------- Conversation memory ----------
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat(payload: ChatRequest, request: Request):
+    conversation_id, history = await load_conversation(request, payload)
+
+    result = await call_ollama(
+        request,
+        [*history, {"role": "user", "content": payload.message}],
+    )
+
+    record_id = await save_chat_turn(
+        request,
+        conversation_id,
+        payload.message,
+        result,
+    )
+
     return {
         **result,
         "id": record_id,
         "conversation_id": conversation_id,
     }
+
+
+@router.post("/chat/stream")
+async def chat_stream(payload: ChatRequest, request: Request):
+    conversation_id, history = await load_conversation(request, payload)
+
+    response = await open_ollama_stream(
+        request,
+        [*history, {"role": "user", "content": payload.message}],
+    )
+
+    async def save(result: dict) -> None:
+        await save_chat_turn(
+            request,
+            conversation_id,
+            payload.message,
+            result,
+        )
+
+    # The body is plain text, so the conversation id travels in a header.
+    return stream_answer(
+        request,
+        response,
+        save,
+        headers={"X-Conversation-ID": str(conversation_id)},
+    )
 
 
 # ---------- Paginated request history ----------
@@ -556,3 +693,68 @@ async def get_conversation_messages(
         }
         for row in rows
     ]
+
+# ---------- generate json messages ----------
+@router.post(
+    "/generate-json",
+    response_model=StructuredJSONResponse,
+)
+async def generate_json(
+    payload: SkillExtractionRequest,
+    request: Request,
+):
+    prompt = f"""
+Extract information from the following text.
+
+Return:
+- name: person's name
+- role: person's professional role
+- skills: list of technical skills
+
+If a value cannot be identified, use an empty string
+for name or role, and an empty list for skills.
+
+Text:
+{payload.text}
+"""
+
+    schema = SkillExtractionResult.model_json_schema()
+
+    try:
+        result = await request.app.state.ai_client.generate_json(
+            prompt=prompt,
+            schema=schema,
+        )
+
+        # Validate the JSON returned by the LLM.
+        validated_data = SkillExtractionResult.model_validate(
+            result["data"]
+        )
+
+        return {
+            "model": result["model"],
+            "data": validated_data,
+            "usage": result["usage"],
+            "performance": result["performance"],
+        }
+
+    except ValidationError as exc:
+        logging.exception("Invalid structured JSON from Ollama")
+        raise HTTPException(
+            status_code=502,
+            detail="The LLM returned data that did not match the expected schema.",
+        ) from exc
+
+    except ValueError as exc:
+        logging.exception("Failed to parse JSON returned by Ollama")
+        raise HTTPException(
+            status_code=502,
+            detail="The LLM returned invalid JSON.",
+        ) from exc
+
+    except httpx.HTTPError as exc:
+        logging.exception("Ollama request failed")
+        raise HTTPException(
+            status_code=502,
+            detail="The Ollama service request failed.",
+        ) from exc
