@@ -13,17 +13,14 @@ from app.services.ai_client import AIClient
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize database connections and sessions.
     engine, session_factory = create_database()
 
     app.state.engine = engine
     app.state.session_factory = session_factory
 
     try:
-        # Create missing tables before serving requests.
         await create_tables(engine)
 
-        # Initialize the Ollama client.
         app.state.ai_client = AIClient()
 
         yield
@@ -45,6 +42,4 @@ app.include_router(ai_router)
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
-    }
+    return {"status": "ok"}

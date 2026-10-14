@@ -23,17 +23,12 @@ class AIClient:
             ),
         )
 
-    async def generate(self, prompt: str) -> dict:
+    async def chat(self, messages: list[dict]) -> dict:
         response = await self.client.post(
             "/api/chat",
             json={
                 "model": self.model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    }
-                ],
+                "messages": messages,
                 "stream": False,
             },
         )
@@ -42,18 +37,18 @@ class AIClient:
         data = response.json()
 
         # Extract token statistics from Ollama
-        input_tokens = data.get("prompt_eval_count", 0)
-        output_tokens = data.get("eval_count", 0)
+        input_tokens = data.get("prompt_eval_count") or 0
+        output_tokens = data.get("eval_count") or 0
 
         # Ollama reports durations in nanoseconds
-        prompt_duration_ns = data.get(
-            "prompt_eval_duration", 0
+        prompt_duration_ns = (
+            data.get("prompt_eval_duration") or 0
         )
-        generation_duration_ns = data.get(
-            "eval_duration", 0
+        generation_duration_ns = (
+            data.get("eval_duration") or 0
         )
-        total_duration_ns = data.get(
-            "total_duration", 0
+        total_duration_ns = (
+            data.get("total_duration") or 0
         )
 
         # Calculate generation speed
@@ -80,6 +75,15 @@ class AIClient:
                 ),
             },
         }
+
+    async def generate(self, prompt: str) -> dict:
+        # Preserve the existing single-prompt API.
+        return await self.chat([
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ])
 
     async def close(self):
         await self.client.aclose()
