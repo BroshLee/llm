@@ -6,3 +6,4 @@ python-dotenv==1.2.4
 sqlalchemy==2.0.54
 asyncpg==0.32.0
 alembic
+qdrant-client==1.19.1
