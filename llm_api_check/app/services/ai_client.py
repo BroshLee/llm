@@ -38,6 +38,7 @@ class AIClient:
             "llama3:latest",
         )
 
+
         # Keeps the model in RAM between requests (Ollama's default is 5m).
         self.keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 
@@ -47,6 +48,19 @@ class AIClient:
                 180.0,
                 connect=5.0,
             ),
+        )
+
+        self.num_ctx = int(
+            os.getenv("OLLAMA_NUM_CTX", "2048")
+        )
+
+        self.num_predict = int(
+            os.getenv("OLLAMA_NUM_PREDICT", "256")
+        )
+
+        self.embedding_model = os.getenv(
+            "OLLAMA_EMBED_MODEL",
+            "nomic-embed-text",
         )
 
     async def _post(self, path: str, body: dict) -> dict:
@@ -101,7 +115,13 @@ class AIClient:
     async def chat(self, messages: list[dict]) -> dict:
         data = await self._post(
             "/api/chat",
-            {"messages": self._with_system_prompt(messages)},
+            {
+                "messages": self._with_system_prompt(messages),
+                "options": {
+                    "num_ctx": self.num_ctx,
+                    "num_predict": self.num_predict,
+                },
+            },
         )
 
         return {
@@ -114,7 +134,7 @@ class AIClient:
         messages: list[dict],
     ) -> httpx.Response:
         # Returns once Ollama starts answering, so connection/model errors
-        # surface here, before the HTTP response to the caller has started.
+        # surface here before the response to the caller has started.
         request = self.client.build_request(
             "POST",
             "/api/chat",
@@ -123,6 +143,12 @@ class AIClient:
                 "stream": True,
                 "keep_alive": self.keep_alive,
                 "messages": self._with_system_prompt(messages),
+
+                # NEW: Limit context size and generated tokens.
+                "options": {
+                    "num_ctx": self.num_ctx,
+                    "num_predict": self.num_predict,
+                },
             },
         )
         response = await self.client.send(request, stream=True)
@@ -192,3 +218,28 @@ class AIClient:
 
     async def close(self):
         await self.client.aclose()
+
+    async def embed(self, text: str) -> list[float]:
+        """
+        Convert text into a vector using Ollama's embedding API.
+        """
+        response = await self.client.post(
+            "/api/embed",
+            json={
+                "model": self.embedding_model,
+                "input": text,
+                "keep_alive": self.keep_alive,
+            },
+        )
+
+        response.raise_for_status()
+        data = response.json()
+
+        embeddings = data.get("embeddings")
+
+        if not embeddings or not embeddings[0]:
+            raise ValueError(
+                "Ollama returned an empty embedding."
+            )
+
+        return embeddings[0]

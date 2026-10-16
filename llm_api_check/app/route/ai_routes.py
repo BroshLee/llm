@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import httpx
+import time
 
 from fastapi import (
     APIRouter,
@@ -92,6 +93,7 @@ class PromptResponse(BaseModel):
     answer: str
     usage: TokenUsage
     performance: Performance
+    cache_hit: bool = False
 
 
 class ChatResponse(PromptResponse):
@@ -444,15 +446,63 @@ async def generate_answer(
     payload: PromptRequest,
     request: Request,
 ):
-    result = await call_ollama(
-        request,
-        [{"role": "user", "content": payload.prompt}],
+    ai_client = request.app.state.ai_client
+    response_cache = request.app.state.response_cache
+
+    # Measure cache lookup time separately from LLM generation.
+    cache_started = time.perf_counter_ns()
+
+    cached_result, query_vector = await response_cache.lookup(
+        prompt=payload.prompt,
+        model=ai_client.model,
+        ai_client=ai_client,
     )
 
-    record_id = await save_generation(request, payload.prompt, result)
+    if cached_result is not None:
+        # Exact or semantic cache hit: do not call the chat model.
+        elapsed_ns = time.perf_counter_ns() - cache_started
 
-    return {**result, "id": record_id}
+        result = response_cache.make_cache_hit(
+            cached_result,
+            elapsed_ns,
+        )
+        cache_hit = True
 
+    else:
+        # Cache miss: use the existing Ollama call.
+        result = await call_ollama(
+            request,
+            [
+                {
+                    "role": "user",
+                    "content": payload.prompt,
+                }
+            ],
+        )
+
+        cache_hit = False
+
+        # Save the answer for future exact and semantic lookups.
+        await response_cache.store(
+            prompt=payload.prompt,
+            model=ai_client.model,
+            result=result,
+            ai_client=ai_client,
+            vector=query_vector,
+        )
+
+    # Keep the existing PostgreSQL history and usage persistence.
+    record_id = await save_generation(
+        request,
+        payload.prompt,
+        result,
+    )
+
+    return {
+        **result,
+        "id": record_id,
+        "cache_hit": cache_hit,
+    }
 
 @router.post("/generate/stream")
 async def generate_answer_stream(
