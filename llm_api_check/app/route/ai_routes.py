@@ -2,6 +2,7 @@
 import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from typing import Literal
 
 import httpx
 import time
@@ -43,8 +44,13 @@ router = APIRouter(
 
 # ---------- Input validation ----------
 
+# "auto" picks the math model when the text looks like a math question.
+Task = Literal["auto", "math", "general"]
+
+
 class PromptRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=10000)
+    task: Task = "auto"
 
     @field_validator("prompt")
     @classmethod
@@ -60,6 +66,7 @@ class PromptRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=10000)
     conversation_id: int | None = Field(default=None, gt=0)
+    task: Task = "auto"
 
     @field_validator("message")
     @classmethod
@@ -230,18 +237,24 @@ def ollama_errors(request: Request):
         ) from exc
 
 
-async def call_ollama(request: Request, messages: list[dict]) -> dict:
+async def call_ollama(
+    request: Request,
+    messages: list[dict],
+    model: str,
+) -> dict:
     with ollama_errors(request):
-        return await request.app.state.ai_client.chat(messages)
+        return await request.app.state.ai_client.chat(messages, model)
 
 
 async def open_ollama_stream(
     request: Request,
     messages: list[dict],
+    model: str,
 ) -> httpx.Response:
     with ollama_errors(request):
         return await request.app.state.ai_client.open_chat_stream(
-            messages
+            messages,
+            model,
         )
 
 
@@ -448,13 +461,14 @@ async def generate_answer(
 ):
     ai_client = request.app.state.ai_client
     response_cache = request.app.state.response_cache
+    model = ai_client.model_for(payload.prompt, payload.task)
 
     # Measure cache lookup time separately from LLM generation.
     cache_started = time.perf_counter_ns()
 
     cached_result, query_vector = await response_cache.lookup(
         prompt=payload.prompt,
-        model=ai_client.model,
+        model=model,
         ai_client=ai_client,
     )
 
@@ -478,6 +492,7 @@ async def generate_answer(
                     "content": payload.prompt,
                 }
             ],
+            model,
         )
 
         cache_hit = False
@@ -485,7 +500,7 @@ async def generate_answer(
         # Save the answer for future exact and semantic lookups.
         await response_cache.store(
             prompt=payload.prompt,
-            model=ai_client.model,
+            model=model,
             result=result,
             ai_client=ai_client,
             vector=query_vector,
@@ -509,9 +524,15 @@ async def generate_answer_stream(
     payload: PromptRequest,
     request: Request,
 ):
+    model = request.app.state.ai_client.model_for(
+        payload.prompt,
+        payload.task,
+    )
+
     response = await open_ollama_stream(
         request,
         [{"role": "user", "content": payload.prompt}],
+        model,
     )
 
     async def save(result: dict) -> None:
@@ -526,9 +547,16 @@ async def generate_answer_stream(
 async def chat(payload: ChatRequest, request: Request):
     conversation_id, history = await load_conversation(request, payload)
 
+    # Routed per message, so one conversation can mix models.
+    model = request.app.state.ai_client.model_for(
+        payload.message,
+        payload.task,
+    )
+
     result = await call_ollama(
         request,
         [*history, {"role": "user", "content": payload.message}],
+        model,
     )
 
     record_id = await save_chat_turn(
@@ -549,9 +577,15 @@ async def chat(payload: ChatRequest, request: Request):
 async def chat_stream(payload: ChatRequest, request: Request):
     conversation_id, history = await load_conversation(request, payload)
 
+    model = request.app.state.ai_client.model_for(
+        payload.message,
+        payload.task,
+    )
+
     response = await open_ollama_stream(
         request,
         [*history, {"role": "user", "content": payload.message}],
+        model,
     )
 
     async def save(result: dict) -> None:
