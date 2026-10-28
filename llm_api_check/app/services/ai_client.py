@@ -1,29 +1,27 @@
 import json
 import os
+import re
 
 import httpx
 
 
-SYSTEM_PROMPT = """
-You are a helpful technical assistant.
+# Kept short: small models like phi3 copy the prompt's style (lists, headings)
+# and ignore the user's requested length when the instructions are long.
+SYSTEM_PROMPT = (
+    "You are a helpful technical assistant. Answer the user's question "
+    "directly and concisely, respecting any requested length or format. "
+    "Use Markdown and fenced code blocks only when the answer needs code "
+    "or structure."
+)
 
-Format your answers using clean, readable Markdown.
-
-Follow these rules:
-1. Start with a short, descriptive heading when appropriate.
-2. Use clear section headings for longer answers.
-3. Use bullet points or numbered steps for explanations.
-4. Put Python code inside fenced code blocks with the python language label.
-5. Use inline code formatting for variables, functions, commands,
-   filenames, and API endpoints.
-6. Use tables only when comparing multiple items.
-7. Explain code examples in simple, step-by-step language.
-8. Highlight important warnings and key takeaways.
-9. Avoid unnecessary repetition and excessively long paragraphs.
-10. Adapt the structure to the question. For simple questions,
-    answer concisely without unnecessary headings.
-11. Do not invent facts or claim that code was executed when it was not.
-"""
+# Cheap keyword/arithmetic check so routing needs no extra LLM call.
+MATH_PATTERN = re.compile(
+    r"\d\s*[+*/^=x]\s*\d|\d\s+-\s+\d"
+    r"|\b(solve|equation|calculate|compute|integral|integrate|derivative|"
+    r"differentiate|algebra|geometry|trigonometry|probability|matrix|"
+    r"factorial|sqrt|square root|logarithm|percentage|prime number)\b",
+    re.IGNORECASE,
+)
 
 
 class AIClient:
@@ -38,6 +36,7 @@ class AIClient:
             "llama3:latest",
         )
 
+        self.math_model = os.getenv("OLLAMA_MATH_MODEL", self.model)
 
         # Keeps the model in RAM between requests (Ollama's default is 5m).
         self.keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
@@ -58,16 +57,48 @@ class AIClient:
             os.getenv("OLLAMA_NUM_PREDICT", "256")
         )
 
+        # Unset means Ollama's default (0.8); 0 gives repeatable answers.
+        temperature = os.getenv("OLLAMA_TEMPERATURE")
+        self.temperature = (
+            float(temperature) if temperature else None
+        )
+
         self.embedding_model = os.getenv(
             "OLLAMA_EMBED_MODEL",
             "nomic-embed-text",
         )
 
-    async def _post(self, path: str, body: dict) -> dict:
+    def model_for(self, text: str, task: str = "auto") -> str:
+        if task == "math":
+            return self.math_model
+
+        if task == "auto" and MATH_PATTERN.search(text):
+            return self.math_model
+
+        return self.model
+
+    def _options(self, limit_output: bool = True) -> dict:
+        # Same num_ctx on every call, otherwise Ollama reloads the model.
+        options = {"num_ctx": self.num_ctx}
+
+        if limit_output:
+            options["num_predict"] = self.num_predict
+
+        if self.temperature is not None:
+            options["temperature"] = self.temperature
+
+        return options
+
+    async def _post(
+        self,
+        path: str,
+        body: dict,
+        model: str | None = None,
+    ) -> dict:
         response = await self.client.post(
             path,
             json={
-                "model": self.model,
+                "model": model or self.model,
                 "stream": False,
                 "keep_alive": self.keep_alive,
                 **body,
@@ -112,16 +143,18 @@ class AIClient:
             *messages,
         ]
 
-    async def chat(self, messages: list[dict]) -> dict:
+    async def chat(
+        self,
+        messages: list[dict],
+        model: str | None = None,
+    ) -> dict:
         data = await self._post(
             "/api/chat",
             {
                 "messages": self._with_system_prompt(messages),
-                "options": {
-                    "num_ctx": self.num_ctx,
-                    "num_predict": self.num_predict,
-                },
+                "options": self._options(),
             },
+            model,
         )
 
         return {
@@ -132,6 +165,7 @@ class AIClient:
     async def open_chat_stream(
         self,
         messages: list[dict],
+        model: str | None = None,
     ) -> httpx.Response:
         # Returns once Ollama starts answering, so connection/model errors
         # surface here before the response to the caller has started.
@@ -139,16 +173,11 @@ class AIClient:
             "POST",
             "/api/chat",
             json={
-                "model": self.model,
+                "model": model or self.model,
                 "stream": True,
                 "keep_alive": self.keep_alive,
                 "messages": self._with_system_prompt(messages),
-
-                # NEW: Limit context size and generated tokens.
-                "options": {
-                    "num_ctx": self.num_ctx,
-                    "num_predict": self.num_predict,
-                },
+                "options": self._options(),
             },
         )
         response = await self.client.send(request, stream=True)
@@ -189,13 +218,15 @@ class AIClient:
         finally:
             await response.aclose()
 
-    async def generate(self, prompt: str) -> dict:
-        return await self.chat([
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ])
+    async def generate(
+        self,
+        prompt: str,
+        model: str | None = None,
+    ) -> dict:
+        return await self.chat(
+            [{"role": "user", "content": prompt}],
+            model,
+        )
 
     async def generate_json(
         self,
@@ -207,6 +238,8 @@ class AIClient:
             {
                 "prompt": prompt,
                 "format": schema,
+                # No num_predict: a cut-off answer would be invalid JSON.
+                "options": self._options(limit_output=False),
             },
         )
 
